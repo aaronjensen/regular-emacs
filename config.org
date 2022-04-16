@@ -1,2 +1,447 @@
 #+title: Regular Emacs Config
 #+startup: hideblocks
+
+* Startup
+
+If Emacs version changed, the bytecode is no longer valid and we must recompile.
+
+#+begin_src emacs-lisp
+(eval
+ `(unless (equal
+           (emacs-version)
+           ',(eval-when-compile
+               (emacs-version)))
+    (throw 'stale-bytecode nil)))
+#+end_src
+
+Disable =load-prefer-newer= now. It likely slows things down and we only needed
+it enabled initially for loading this config in =init.el=.
+
+#+begin_src emacs-lisp
+(setq load-prefer-newer noninteractive)
+#+end_src
+
+* Environment Constants
+
+Helpful constants that will be used while configuring.
+
+#+begin_src emacs-lisp
+(defmacro when-mac (&rest body)
+  "If COND yields non-nil, do BODY, else return nil.
+When COND yields non-nil, eval BODY forms sequentially and return
+value of last one, or nil if there are none.
+
+\(fn COND BODY...)"
+  (declare (indent 0) (debug t))
+  (when (eq system-type 'darwin)
+    (cons 'progn body)))
+
+(defmacro when-linux (&rest body)
+  "If COND yields non-nil, do BODY, else return nil.
+When COND yields non-nil, eval BODY forms sequentially and return
+value of last one, or nil if there are none.
+
+\(fn COND BODY...)"
+  (declare (indent 0) (debug t))
+  (when (eq system-type 'gnu-linux)
+    (cons 'progn body)))
+#+end_src
+
+* Utility Functions
+:PROPERTIES:
+:ID:       632B5B5D-9AD6-4F30-A4C3-E99B33DA4FD6
+:END:
+
+Load built-in utilities we use
+
+#+begin_src emacs-lisp
+(eval-when-compile
+  (require 'cl-lib)
+  (require 'rx))
+#+end_src
+
+Helpful macros to define advice and hooks. Taken from [[https://github.com/raxod502/radian/blob/develop/emacs/radian.el][radian]] and [[https://github.com/hlissner/doom-emacs][doom]].
+
+#+begin_src emacs-lisp
+(defmacro aj-defadvice (name arglist where place docstring &rest body)
+  "Define an advice called NAME and add it to a function.
+ARGLIST is as in `defun'. WHERE is a keyword as passed to
+`advice-add', and PLACE is the function to which to add the
+advice, like in `advice-add'. PLACE should be sharp-quoted.
+DOCSTRING and BODY are as in `defun'."
+  (declare (indent 2)
+           (doc-string 5))
+  (unless (stringp docstring)
+    (error "Config: advice `%S' not documented'" name))
+  (unless (and (listp place)
+               (= 2 (length place))
+               (eq (nth 0 place) 'function)
+               (symbolp (nth 1 place)))
+    (error "Config: advice `%S' does not sharp-quote place `%S'" name place))
+  `(progn
+     ;; You'd think I would put an `eval-and-compile' around this. It
+     ;; turns out that doing so breaks the ability of
+     ;; `elisp-completion-at-point' to complete on function arguments
+     ;; to the advice. I know, right? Apparently this is because the
+     ;; code that gets the list of lexically bound symbols at point
+     ;; tries to `macroexpand-all', and apparently macroexpanding
+     ;; `eval-and-compile' goes ahead and evals the thing and returns
+     ;; only the function symbol. No good. But the compiler does still
+     ;; want to know the function is defined (this is a Gilardi
+     ;; scenario), so we pacify it by `eval-when-compile'ing something
+     ;; similar (see below).
+     (defun ,name ,arglist
+       ,(let ((article (if (string-match-p "^:[aeiou]" (symbol-name where))
+                           "an"
+                         "a")))
+          (format "%s\n\nThis is %s `%S' advice for `%S'."
+                  docstring article where
+                  (if (and (listp place)
+                           (memq (car place) ''function))
+                      (cadr place)
+                    place)))
+       ,@body)
+     (eval-when-compile
+       (declare-function ,name nil))
+     (advice-add ,place ',where #',name)
+     ',name))
+
+(defun aj-unquote (exp)
+  "Return EXP unquoted."
+  (declare (pure t) (side-effect-free t))
+  (while (memq (car-safe exp) '(quote function))
+    (setq exp (cadr exp)))
+  exp)
+
+(defun aj-enlist (exp)
+  "Return EXP wrapped in a list, or as-is if already a list."
+  (declare (pure t) (side-effect-free t))
+  (if (listp exp) exp (list exp)))
+
+(defun aj--resolve-hook-forms (hooks)
+  "Converts a list of modes into a list of hook symbols.
+If a mode is quoted, it is left as is. If the entire HOOKS list is quoted, the
+list is returned as-is."
+  (declare (pure t) (side-effect-free t))
+  (let ((hook-list (aj-enlist (aj-unquote hooks))))
+    (if (eq (car-safe hooks) 'quote)
+        hook-list
+      (cl-loop for hook in hook-list
+               if (eq (car-safe hook) 'quote)
+               collect (cadr hook)
+               else collect (intern (format "%s-hook" (symbol-name hook)))))))
+
+(defun aj--setq-hook-fns (hooks rest &optional singles)
+  (unless (or singles (= 0 (% (length rest) 2)))
+    (signal 'wrong-number-of-arguments (list #'cl-evenp (length rest))))
+  (cl-loop with vars = (let ((args rest)
+                             vars)
+                         (while args
+                           (push (if singles
+                                     (list (pop args))
+                                   (cons (pop args) (pop args)))
+                                 vars))
+                         (nreverse vars))
+           for hook in (aj--resolve-hook-forms hooks)
+           for mode = (string-remove-suffix "-hook" (symbol-name hook))
+           append
+           (cl-loop for (var . val) in vars
+                    collect
+                    (list var val hook
+                          (intern (format "aj--setq-%s-for-%s-h"
+                                          var mode))))))
+
+(defmacro aj-defhook (name arglist hooks docstring &rest body)
+  "Define a function called NAME and add it to a hook.
+ARGLIST is as in `defun'. HOOKS is a list of hooks to which to
+add the function, or just a single hook. DOCSTRING and BODY are
+as in `defun'."
+  (declare (indent 2)
+           (doc-string 4))
+  (unless (listp hooks)
+    (setq hooks (list hooks)))
+  (dolist (hook hooks)
+    (unless (string-match-p "-\\(hook\\|functions\\)$" (symbol-name hook))
+      (error "Symbol `%S' is not a hook" hook)))
+  (unless (stringp docstring)
+    (error "Config: no docstring provided for `aj-defhook'"))
+  (let ((hooks-str (format "`%S'" (car hooks))))
+    (dolist (hook (cdr hooks))
+      (setq hooks-str (format "%s\nand `%S'" hooks-str hook)))
+    `(progn
+       (defun ,name ,arglist
+         ,(format "%s\n\nThis function is for use in %s."
+                  docstring hooks-str)
+         ,@body)
+       (dolist (hook ',hooks)
+         (add-hook hook ',name)))))
+
+(defmacro aj-setq-hook (hooks &rest var-vals)
+  "Sets buffer-local variables on HOOKS.
+\(fn HOOKS &rest [SYM VAL]...)"
+  (declare (indent 1))
+  (macroexp-progn
+   (cl-loop for (var val hook fn) in (aj--setq-hook-fns hooks var-vals)
+            collect `(defun ,fn (&rest _)
+                       ,(format "%s = %s" var (pp-to-string val))
+                       (setq-local ,var ,val))
+            collect `(remove-hook ',hook #',fn) ; ensure set order
+            collect `(add-hook ',hook #',fn))))
+
+(defmacro aj-unsetq-hook (hooks &rest vars)
+  "Unbind setq hooks on HOOKS for VARS.
+\(fn HOOKS &rest [SYM VAL]...)"
+  (declare (indent 1))
+  (macroexp-progn
+   (cl-loop for (_var _val hook fn)
+            in (aj--setq-hook-fns hooks vars 'singles)
+            collect `(remove-hook ',hook #',fn))))
+
+(defmacro aj-delq (elt list &optional fetcher)
+  "`delq' ELT from LIST in-place.
+If FETCHER is a function, ELT is used as the key in LIST (an alist)."
+  `(setq ,list
+         (delq ,(if fetcher
+                    `(funcall ,fetcher ,elt ,list)
+                  elt)
+               ,list)))
+#+end_src
+
+Other utility functions and macros useful for the config, some taken from radian.
+
+#+begin_src emacs-lisp
+(defmacro after (package &rest body)
+  "Evaluate BODY after PACKAGE have loaded.
+
+PACKAGE is a symbol or list of them."
+  (declare (indent defun))
+  (if (symbolp package)
+      (progn
+        (when (bound-and-true-p byte-compile-current-file)
+         (require package nil t))
+        (let ((body (macroexp-progn body)))
+          `(eval-after-load ',package ',body)))
+    (dolist (next package)
+      (setq body `((after ,next ,@body))))
+    (car body)))
+
+(defmacro after-init (&rest body)
+  "Evaluate BODY after init or immediately if we have already init."
+  (declare (indent defun))
+  (let ((body (macroexp-progn body)))
+    `(if after-init-time
+         ,body
+       (add-hook 'after-init-hook (lambda () ,body)))))
+
+(defmacro aj-flet (bindings &rest body)
+  "Temporarily override function definitions using `cl-letf*'.
+BINDINGS are composed of `defun'-ish forms. NAME is the function
+to override. It has access to the original function as a
+lexically bound variable by the same name, for use with
+`funcall'. ARGLIST and BODY are as in `defun'.
+\(fn ((defun NAME ARGLIST &rest BODY) ...) BODY...)"
+  (declare (indent defun))
+  `(cl-letf* (,@(cl-mapcan
+                 (lambda (binding)
+                   (when (memq (car binding) '(defun lambda))
+                     (setq binding (cdr binding)))
+                   (cl-destructuring-bind (name arglist &rest body) binding
+                     (list
+                      `(,name (symbol-function #',name))
+                      `((symbol-function #',name)
+                        (lambda ,arglist
+                          ,@body)))))
+                 bindings))
+     ,@body))
+
+(defmacro aj--with-silent-write (&rest body)
+  "Execute BODY, with the function `write-region' made silent."
+  (declare (indent 0))
+  `(aj-flet ((defun write-region
+                 (start end filename &optional append visit lockname
+                        mustbenew)
+               (funcall write-region start end filename append 0
+                        lockname mustbenew)
+               (when (or (stringp visit) (eq visit t))
+                 (setq buffer-file-name
+                       (if (stringp visit)
+                           visit
+                         filename))
+                 (set-visited-file-modtime)
+                 (set-buffer-modified-p nil))))
+            (cl-letf (((symbol-function #'message) #'ignore))
+              ,@body)))
+
+(defmacro aj--with-silent-message (regexps &rest body)
+  "Silencing any messages that match REGEXPS, execute BODY.
+REGEXPS is a list of strings; if `message' would display a
+message string (not including the trailing newline) matching any
+element of REGEXPS, nothing happens. The REGEXPS need not match
+the entire message; include ^ and $ if necessary. REGEXPS may
+also be a single string."
+  (declare (indent 1))
+  (let ((regexps-sym (cl-gensym "regexps")))
+    `(let ((,regexps-sym ,regexps))
+       (when (stringp ,regexps-sym)
+         (setq ,regexps-sym (list ,regexps-sym)))
+       (aj-flet ((defun message (format &rest args)
+                       (let ((str (apply #'format format args)))
+                         ;; Can't use an unnamed block because during
+                         ;; byte-compilation, some idiot loads `cl', which
+                         ;; sticks an advice onto `dolist' that makes it
+                         ;; behave like `cl-dolist' (i.e., wrap it in
+                         ;; another unnamed block) and therefore breaks
+                         ;; this code.
+                         (cl-block done
+                           (dolist (regexp ,regexps-sym)
+                             (when (or (null regexp)
+                                       (string-match-p regexp str))
+                               (cl-return-from done)))
+                           (funcall message "%s" str)))))
+         ,@body))))
+
+(defun aj--path-join (path &rest segments)
+  "Join PATH with SEGMENTS using `expand-file-name'.
+First `expand-file-name' is called on the first member of
+SEGMENTS, with PATH as DEFAULT-DIRECTORY. Then `expand-file-name'
+is called on the second member, with the result of the first call
+as DEFAULT-DIRECTORY, and so on. If no SEGMENTS are passed, the
+return value is just PATH."
+  (while segments
+    (setq path (expand-file-name (pop segments) path)))
+  path)
+
+(defun aj--advice-silence-messages (func &rest args)
+  "Invoke FUNC with ARGS, silencing all messages.
+This is an `:override' advice for many different functions."
+  (cl-letf (((symbol-function #'message) #'ignore))
+    (apply func args)))
+#+end_src
+
+* Package Management
+
+** straight.el
+
+=straight.el= is an alternative (to package.el) package manager that allows for
+easier editing of packages.
+
+Use a different straight directory per emacs version.
+
+#+begin_src emacs-lisp
+(defvar straight-base-dir
+  (if (eq 29 emacs-major-version)
+      user-emacs-directory
+    (concat user-emacs-directory "straight/" (number-to-string emacs-major-version))))
+#+end_src
+
+Use file watchers to detect package modifications. This saves time at startup.
+
+When launched from the Emacs.app symlink, =/usr/local/bin= is not included in
+our path for some reason and it's necessary to find watchexec and python3.
+
+If python3 or watchexec are not installed, a warning is printed, which should
+prompt the installation of the missing dependency.
+
+#+begin_src emacs-lisp
+(add-to-list 'exec-path "/usr/local/bin")
+
+(setq straight-check-for-modifications '(watch-files find-when-checking))
+#+end_src
+
+Use the =develop= version, which is possibly less stable, but has at least one
+nice feature (recipe merging).
+
+#+begin_src emacs-lisp
+(setq straight-repository-branch "develop")
+#+end_src
+
+Bootstrap =straight.el=, that is, download it and install it if it hasn't been installed yet.
+
+#+begin_src emacs-lisp
+(defvar bootstrap-version)
+(let ((bootstrap-file
+       (expand-file-name "straight/repos/straight.el/bootstrap.el" straight-base-dir))
+      (bootstrap-version 5))
+  (unless (file-exists-p bootstrap-file)
+    (with-current-buffer
+        (url-retrieve-synchronously
+         "https://raw.githubusercontent.com/raxod502/straight.el/develop/install.el"
+         'silent 'inhibit-cookies)
+      (goto-char (point-max))
+      (eval-print-last-sexp)))
+  (load bootstrap-file nil 'nomessage))
+#+end_src
+
+** use-package
+
+Install =use-package=.
+
+#+begin_src emacs-lisp
+(straight-use-package 'use-package)
+(setq straight-use-package-by-default t)
+(setq use-package-use-theme nil)
+#+end_src
+
+Defer package loading by default for performance.
+
+#+begin_src emacs-lisp
+(setq use-package-always-defer t)
+#+end_src
+
+Helper macro for packages we want to use use-package with, but are
+already installed.
+
+#+begin_src emacs-lisp
+(defmacro use-feature (name &rest args)
+  "Like `use-package', but with `straight-use-package-by-default' disabled.
+    NAME and ARGS are as in `use-package'."
+  (declare (indent defun))
+  `(use-package ,name
+     :straight nil
+     ,@args))
+#+end_src
+
+** Bind Key
+
+Needed for use-package and provides =bind-key= macro.
+
+#+begin_src emacs-lisp
+(use-package bind-key
+  :demand t)
+#+end_src
+
+* Base Settings
+
+** No Littering
+
+The [[https://github.com/emacscollective/no-littering][no-littering]] package moves common files normally written to the .emacs.d
+directory to directories that are out of the way and gitignored.
+
+#+begin_src emacs-lisp
+(use-package no-littering
+  :demand t)
+#+end_src
+
+Put recentf artifacts in there too.
+
+#+begin_src emacs-lisp
+(use-feature recentf
+  :config
+  (add-to-list 'recentf-exclude no-littering-var-directory)
+  (add-to-list 'recentf-exclude no-littering-etc-directory))
+#+end_src
+
+And abbrev_defs.
+
+#+begin_src emacs-lisp
+(setq abbrev-file-name (no-littering-expand-var-file-name "abbrev_defs"))
+#+end_src
+
+And auto-save files.
+
+#+begin_src emacs-lisp
+(after-init
+  ;; For some reason setting this in early-init does not work.
+  (setq auto-save-list-file-prefix (no-littering-expand-var-file-name "auto-save/sessions/")
+        auto-save-file-name-transforms `((".*" ,(no-littering-expand-var-file-name "auto-save/") t))))
+#+end_src
