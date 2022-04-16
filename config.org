@@ -1,0 +1,2 @@
+#+title: Regular Emacs Config
+#+startup: hideblocks
