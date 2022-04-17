@@ -1,3 +1,5 @@
-/eln-cache
+/eln-cache/
 /config.el
 /straight/
+/var/
+/etc/
