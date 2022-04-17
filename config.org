@@ -445,3 +445,64 @@ And auto-save files.
   (setq auto-save-list-file-prefix (no-littering-expand-var-file-name "auto-save/sessions/")
         auto-save-file-name-transforms `((".*" ,(no-littering-expand-var-file-name "auto-save/") t))))
 #+end_src
+
+* UX
+
+** Tabs
+
+#+begin_src emacs-lisp
+(use-feature tab-line
+  :preface
+  (defun aj/tab-line-mouse-move-tab (event)
+    "Drag tab to different location or window."
+    (interactive "e")
+    (let* ((from-window (posn-window (event-start event)))
+           (to-window (posn-window (event-end event)))
+           (from (tab-line--get-tab-property 'tab (car (posn-string (event-start event)))))
+           (to (car (posn-string (event-end event))))
+           (to (and to
+                    (tab-line--get-tab-property 'tab to)))
+           (from-prev-buffer (assq from (window-prev-buffers))))
+      (unless (or (eq from to) (eq from nil))
+        (select-window from-window)
+
+        (when (not (eq from-window to-window))
+          (tab-line-close-tab event)
+          (select-window to-window))
+
+        (let* ((next-buffers (delq from (tab-line-tabs-window-buffers)))
+               (next-buffers (seq-drop-while (lambda (buffer) (not (eq buffer to)))
+                                             next-buffers))
+               (_ (when (not (eq from-window to-window))
+                    (switch-to-buffer from)))
+               (prev-buffers (assq-delete-all from (window-prev-buffers))))
+          (when (and (eq from-window to-window)
+                     (seq-contains-p (window-next-buffers) to))
+            (progn
+              (setq next-buffers (cdr next-buffers))))
+          (set-window-prev-buffers to-window (seq-filter 'identity prev-buffers))
+          (set-window-next-buffers to-window next-buffers))
+        (force-mode-line-update))))
+
+  (defun aj/tab-line-bury-buffer-or-delete-window (tab)
+    "Bury the current buffer or delete the window."
+    (let ((buffer (if (bufferp tab) tab (cdr (assq 'buffer tab)))))
+      (cond
+       ((length= (funcall tab-line-tabs-function) 1)
+        (delete-window))
+       ((eq buffer (current-buffer))
+        (bury-buffer))
+       (t
+        (set-window-prev-buffers nil (assq-delete-all buffer (window-prev-buffers)))
+        (set-window-next-buffers nil (delq buffer (window-next-buffers)))))))
+
+  :init
+  (setq tab-line-close-tab-function #'aj/tab-line-bury-buffer-or-delete-window)
+
+  (global-tab-line-mode)
+
+  :config
+  (define-key tab-line-tab-map [tab-line drag-mouse-1] 'aj/tab-line-mouse-move-tab))
+#+end_src
+
+* Scratch
